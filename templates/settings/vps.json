@@ -1,0 +1,21 @@
+{
+  "env": {
+    "CLAUDE_ENVIRONMENT": "vps",
+    "CLAUDE_MACHINE": "aws-lightsail"
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [
+      "Bash(**)",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "mcp__*"
+    ],
+    "deny": []
+  }
+}

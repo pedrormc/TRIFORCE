@@ -1,0 +1,19 @@
+# Sensitive files
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
