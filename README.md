@@ -12,8 +12,8 @@
       ▼          ▼          ▼
  ┌─────────┐ ┌────────┐ ┌──────┐
  │ DESKTOP │ │ MOBILE │ │  VPS │
- │ Master  │ │ Termux │ │Docker│
- │ Windows │ │Android │ │ AWS  │
+ │ Master  │ │ Termux │ │  DO  │
+ │ Windows │ │Android │ │Ubuntu│
  └─────────┘ └────────┘ └──────┘
 ```
 
@@ -32,7 +32,7 @@ TRIFORCE e uma metodologia para operar **3 instancias independentes** do Claude 
 |----------|-----------|------------|-----------|-----|
 | **Desktop** | Windows 11 | Claude Master | TOTAL (acceptEdits) | Dev principal, coordenacao |
 | **Mobile** | Termux/Android | Claude Mobile | RESTRITO (default) | Consultas, emergencias |
-| **VPS** | Docker/AWS Lightsail | Claude VPS | MAXIMO (bypassPermissions) | Automacoes, headless |
+| **VPS** | DigitalOcean (Ubuntu 24.04) | Claude VPS | MAXIMO (bypassPermissions) | Automacoes, headless, Zel (WhatsApp) |
 
 ## Quick Start
 
@@ -47,7 +47,7 @@ TRIFORCE e uma metodologia para operar **3 instancias independentes** do Claude 
 
 - [Setup Desktop (Windows)](docs/setup-desktop.md)
 - [Setup Mobile (Termux/Android)](docs/setup-mobile.md)
-- [Setup VPS (Docker/AWS)](docs/setup-vps.md)
+- [Setup VPS (DigitalOcean)](docs/setup-vps.md)
 
 ### 2. Instale o toolkit compartilhado
 
@@ -80,7 +80,7 @@ TRIFORCE/
 ├── docs/
 │   ├── setup-desktop.md         # Guia completo Desktop (Windows)
 │   ├── setup-mobile.md          # Guia completo Mobile (Termux/Android)
-│   ├── setup-vps.md             # Guia completo VPS (Docker/AWS)
+│   ├── setup-vps.md             # Guia completo VPS (DigitalOcean)
 │   ├── architecture.md          # Arquitetura e decisoes de design
 │   └── troubleshooting.md       # Problemas conhecidos e solucoes
 ├── templates/
