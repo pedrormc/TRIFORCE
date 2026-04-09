@@ -1248,7 +1248,7 @@
   }
 
   # Detect OS to locate vault
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*)
       VAULT="$HOME/Documents/obsidiano"
       ;;
@@ -1388,9 +1388,10 @@
       fi
     fi
 
-    # Auto-commit if in vault
-    if echo "$FILE_PATH" | grep -q "/obsidiano/Claude/memory/"; then
-      VAULT_DIR="${FILE_PATH%%/Claude/memory/*}"
+    # Auto-commit if in vault (portable path match: Unix / or Windows \ or mixed)
+    if echo "$FILE_PATH" | grep -qE "[/\\\\]obsidiano[/\\\\]Claude[/\\\\]memory[/\\\\]"; then
+      # Locate vault root by trimming everything from /Claude/memory/ onwards
+      VAULT_DIR=$(echo "$FILE_PATH" | sed 's|[/\\]Claude[/\\]memory[/\\].*||')
       (cd "$VAULT_DIR" && git add "$FILE_PATH" && git commit -q -m "memory: auto-update $(basename "$FILE_PATH")" 2>/dev/null) || true
     fi
   fi
@@ -1437,7 +1438,7 @@
 
   set -uo pipefail
 
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*) VAULT="$HOME/Documents/obsidiano" ;;
     *) VAULT="$HOME/obsidiano" ;;
   esac
@@ -1513,7 +1514,7 @@
 
   set -uo pipefail
 
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*) VAULT="$HOME/Documents/obsidiano/Claude/sessions" ;;
     *) VAULT="$HOME/obsidiano/Claude/sessions" ;;
   esac
@@ -1579,7 +1580,7 @@
 
   SYSTEM="$1"; shift
 
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*) VAULT="$HOME/Documents/obsidiano" ;;
     *) VAULT="$HOME/obsidiano" ;;
   esac
@@ -1680,7 +1681,7 @@
 
   set -uo pipefail
 
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*) VAULT="$HOME/Documents/obsidiano" ;;
     *) VAULT="$HOME/obsidiano" ;;
   esac
@@ -1849,9 +1850,12 @@
   # ~/.claude/scripts/memory-auto-promote.sh
   # Daily cron — promote cross-project patterns with safety nets (spec §7.6)
 
-  set -uo pipefail
+  # NOTE: we intentionally do NOT use `set -u` here because associative arrays
+  # and group-matching logic reference keys that may not exist yet (bash 5.x
+  # treats unset associative keys as errors under -u). Only -o pipefail is set.
+  set -o pipefail
 
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*) VAULT="$HOME/Documents/obsidiano" ;;
     *) VAULT="$HOME/obsidiano" ;;
   esac
@@ -2073,7 +2077,7 @@
 
   ENTRY_ID="$1"
 
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*) VAULT="$HOME/Documents/obsidiano" ;;
     *) VAULT="$HOME/obsidiano" ;;
   esac
@@ -2096,9 +2100,10 @@
   fi
 
   # Remove lines from the "## [auto-promoted" heading matching entry_id until the next "##" or EOF
+  # Pass entry_id via -v to keep the awk program purely single-quoted (no shell interpolation)
   awk -v eid="$ENTRY_ID" '
     /^## \[auto-promoted/ { in_block = 1; buffer = $0; next }
-    in_block && /entry_id: '"$ENTRY_ID"'/ { in_block = 2; buffer = ""; next }
+    in_block && index($0, "entry_id: " eid) { in_block = 2; buffer = ""; next }
     in_block == 1 && /^##/ { in_block = 0; print buffer; print; next }
     in_block == 1 { buffer = buffer "\n" $0; next }
     in_block == 2 && /^##/ { in_block = 0; print; next }
@@ -2148,10 +2153,19 @@
 
 - [ ] **Step 24.2: Run smoke — expect FAIL**
 
-- [ ] **Step 24.3: Backup current settings.json**
+- [ ] **Step 24.3: Backup current settings.json + pre-check for conflicts**
 
   ```bash
   cp ~/.claude/settings.json ~/.claude/settings.json.pre-foundation-bak
+
+  # Pre-check: if SessionStart already exists with a custom hook, warn loudly
+  EXISTING_SS=$(jq '.hooks.SessionStart // []' ~/.claude/settings.json)
+  if [ "$EXISTING_SS" != "[]" ] && [ "$EXISTING_SS" != "null" ]; then
+    echo "⚠️  existing SessionStart hooks found:"
+    echo "$EXISTING_SS" | jq -r '.[].hooks[].command // empty'
+    echo "Foundation will PREPEND the memory loader (existing hooks preserved)."
+    echo "If you don't want this, abort now."
+  fi
   ```
 
 - [ ] **Step 24.4: Edit settings.json via jq (additive, never overwrite)**
@@ -2553,10 +2567,18 @@
   read -p "Continue? (yes/N): " CONFIRM
   [ "$CONFIRM" = "yes" ] || { echo "aborted"; exit 0; }
 
-  # Restore settings.json from backup
+  # Second-layer safety: backup current settings.json BEFORE restore (in case restore itself fails)
+  if [ -f ~/.claude/settings.json ]; then
+    cp ~/.claude/settings.json ~/.claude/settings.json.uninstall-bak
+    echo "✅ current settings saved to settings.json.uninstall-bak"
+  fi
+
+  # Restore settings.json from pre-foundation backup
   if [ -f ~/.claude/settings.json.pre-foundation-bak ]; then
     cp ~/.claude/settings.json.pre-foundation-bak ~/.claude/settings.json
-    echo "✅ restored settings.json from backup"
+    echo "✅ restored settings.json from pre-foundation backup"
+  else
+    echo "⚠️  no pre-foundation backup found — settings.json left as-is"
   fi
 
   # Delete hooks
@@ -2577,7 +2599,7 @@
   rm -f ~/.claude/rules/common/namespace-cheatsheet.md
 
   # Delete cron / Task Scheduler entries
-  case "$OSTYPE" in
+  case "${OSTYPE:-unknown}" in
     msys*|cygwin*|win32*)
       schtasks /delete /tn "Claude Memory Auto-Promote" /f 2>/dev/null || true
       schtasks /delete /tn "Claude Memory Index Rebuild" /f 2>/dev/null || true
@@ -2606,7 +2628,63 @@
   /tmp/smoke-task29.sh
   ```
 
-- [ ] **Step 29.7: Run the full smoke suite for the first time**
+- [ ] **Step 29.7: Create `test-i4-fake-data.sh` (referenced by I4 integration test)**
+
+  This script creates 3 synthetic auto-memory entries to exercise the auto-promote pipeline end-to-end. Content copied from spec §8.3.1:
+
+  ```bash
+  cat > ~/.claude/scripts/test-i4-fake-data.sh <<'EOSCRIPT'
+  #!/usr/bin/env bash
+  # Creates 3 synthetic auto-memory entries in distinct fake project cwds,
+  # with mtimes older than 7 days, to exercise the auto-promote pipeline.
+
+  set -euo pipefail
+
+  PROJECTS="$HOME/.claude/projects"
+  TARGETS=(
+    "$PROJECTS/fake-proj-alpha/memory"
+    "$PROJECTS/fake-proj-beta/memory"
+    "$PROJECTS/fake-proj-gamma/memory"
+  )
+
+  for dir in "${TARGETS[@]}"; do
+    mkdir -p "$dir"
+    cat > "$dir/feedback_lang.md" <<'EOF'
+  ---
+  name: Communication style
+  description: PT-BR informal, sem emojis, direto
+  type: feedback
+  scope: per-cwd
+  source: auto-memory
+  last_updated: 2026-03-20
+  ---
+
+  PT-BR informal, direto, sem emojis a menos que explicitamente solicitado.
+  EOF
+    touch -d "14 days ago" "$dir/feedback_lang.md"
+  done
+
+  echo "✅ 3 synthetic entries created (14 days old)"
+  echo ""
+  echo "Next steps:"
+  echo "  bash ~/.claude/scripts/memory-auto-promote.sh"
+  echo "  grep -A5 'auto_promoted: true' ~/Documents/obsidiano/Claude/memory/preferences.md"
+  echo "  tail -3 ~/Documents/obsidiano/Claude/memory/.promotion-log.jsonl"
+  echo ""
+  echo "Cleanup after test:"
+  echo "  rm -rf $PROJECTS/fake-proj-{alpha,beta,gamma}"
+  EOSCRIPT
+
+  chmod +x ~/.claude/scripts/test-i4-fake-data.sh
+  ```
+
+  Smoke check:
+
+  ```bash
+  test -x ~/.claude/scripts/test-i4-fake-data.sh && echo "✅ test-i4 script ready"
+  ```
+
+- [ ] **Step 29.8: Run the full smoke suite for the first time**
 
   ```bash
   ~/.claude/scripts/foundation-smoke.sh
@@ -2653,7 +2731,8 @@
   cp ~/.claude/scripts/foundation-smoke.sh scripts/
   cp ~/.claude/scripts/foundation-validate.sh scripts/
   cp ~/.claude/scripts/foundation-uninstall.sh scripts/
-  chmod +x scripts/memory-*.sh scripts/foundation-*.sh
+  cp ~/.claude/scripts/test-i4-fake-data.sh scripts/
+  chmod +x scripts/memory-*.sh scripts/foundation-*.sh scripts/test-i4-fake-data.sh
   ```
 
 - [ ] **Step 30.4: Copy rules + config + template**
@@ -2777,20 +2856,56 @@
 
 > **Execution context:** All commands in this chunk run on the VPS, typically via SSH from Desktop. Prefix with `ssh vps "..."` if executing from Desktop, or run directly after SSHing in.
 
+> **HARD PREREQUISITE (blocks Chunk 4 start):** Chunk 3 Task 31.2 (push toolkit) and Task 31.3 (push vault) MUST have completed successfully. VPS will `git clone` / `git pull` from GitHub, so the remote state must be up-to-date. Verify before starting:
+>
+> ```bash
+> # On Desktop, verify pushes landed:
+> gh api repos/pedrormc/claude-code-toolkit/commits/main --jq '.sha' | head -c 8
+> gh api repos/pedrormc/obsidiano/commits/main --jq '.sha' | head -c 8
+> # Both must return recent SHAs matching your local HEAD.
+> ```
+
 ### Task 32: VPS prerequisites verification
 
-- [ ] **Step 32.1: SSH to VPS and check prerequisites**
+- [ ] **Step 32.1: SSH to VPS and check prerequisites (STRICT — abort on any missing)**
 
   ```bash
   ssh vps  # or equivalent
   ```
 
+  On the VPS, run this single block that fails hard on any missing prerequisite:
+
   ```bash
-  node --version                      # must be >= v20.0.0
-  npx --version                       # must print a version
-  command -v jq || sudo apt-get install -y jq
-  command -v git                      # git must exist
-  bun --version                       # needed for Zel
+  set -e
+  echo "=== VPS prerequisite check ==="
+
+  for cmd in node npx jq git bun; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "❌ MISSING: $cmd"
+      MISSING="yes"
+    else
+      echo "✅ $cmd: $($cmd --version 2>&1 | head -1)"
+    fi
+  done
+
+  # Node version check (must be >= 20)
+  NODE_MAJOR=$(node --version 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')
+  if [ -z "$NODE_MAJOR" ] || [ "$NODE_MAJOR" -lt 20 ]; then
+    echo "❌ Node.js < 20 (need >= 20)"
+    MISSING="yes"
+  fi
+
+  if [ "${MISSING:-}" = "yes" ]; then
+    echo ""
+    echo "❌ One or more prerequisites missing. Install them before continuing:"
+    echo "   Node 20+: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+    echo "   jq: sudo apt-get install -y jq"
+    echo "   bun: curl -fsSL https://bun.sh/install | bash"
+    exit 1
+  fi
+
+  echo ""
+  echo "✅ All VPS prerequisites satisfied"
   ```
 
 - [ ] **Step 32.2: If Node missing, install:**
@@ -2990,30 +3105,56 @@
   git checkout -b feat/foundation-dual-prompt-load
   ```
 
-- [ ] **Step 37.4: Read current whatsapp-channel.ts to find the exact line**
+- [ ] **Step 37.4: Read the ENTIRE file first — do not guess the exact syntax**
 
   ```bash
-  grep -n "readFileSync.*CLAUDE" whatsapp-channel.ts
+  wc -l whatsapp-channel.ts
   ```
 
-- [ ] **Step 37.5: Apply the dual-load patch**
+  Then use the `Read` tool (not `cat`) to read the full file. The Zel codebase may use any of these API flavors:
 
-  Locate the block that reads CLAUDE.md (example — adjust based on actual code):
+  - Node.js: `readFileSync`, `fs.promises.readFile`
+  - Bun: `Bun.file(path).text()`, `await file.text()`
+  - Async: `await readFile(path, 'utf-8')`
 
-  Before (current):
+  **Do NOT apply the example patch below blindly.** First locate the block where the CLAUDE.md system prompt is actually assembled (search for `CLAUDE`, `systemPrompt`, `obsidiano`). Once located, craft the Edit tool call matching the exact existing syntax.
+
+- [ ] **Step 37.5: Apply the dual-load patch matching the file's actual style**
+
+  The goal is to replace a SINGLE CLAUDE.md read with TWO reads concatenated with `\n\n---\n\n`, plus add a `console.log` marker for the log-grep check in Step 38.3.
+
+  **Illustrative example (if the file uses sync readFileSync):**
+
   ```typescript
+  // Before
   const systemPrompt = readFileSync('/home/claude/obsidiano/CLAUDE.md', 'utf-8');
-  ```
 
-  After (patched):
-  ```typescript
+  // After
   const generic = readFileSync('/home/claude/obsidiano/Claude/CLAUDE.md', 'utf-8');
   const persona = readFileSync('/home/claude/obsidiano/Claude/personas/zel.md', 'utf-8');
   const systemPrompt = `${generic}\n\n---\n\n${persona}`;
   console.log('[zel] system prompt loaded: Claude/CLAUDE.md + Claude/personas/zel.md');
   ```
 
-  **IMPORTANT:** the `console.log` line is added deliberately so the log-grep check in Step 37.7 has something to find.
+  **If the file uses Bun.file (more likely in Zel since `package.json` uses `bun whatsapp-channel.ts`):**
+
+  ```typescript
+  // Before
+  const systemPrompt = await Bun.file('/home/claude/obsidiano/CLAUDE.md').text();
+
+  // After
+  const generic = await Bun.file('/home/claude/obsidiano/Claude/CLAUDE.md').text();
+  const persona = await Bun.file('/home/claude/obsidiano/Claude/personas/zel.md').text();
+  const systemPrompt = `${generic}\n\n---\n\n${persona}`;
+  console.log('[zel] system prompt loaded: Claude/CLAUDE.md + Claude/personas/zel.md');
+  ```
+
+  **Verify after Edit** by reading the file again and confirming:
+  - Exactly TWO file reads targeting `Claude/CLAUDE.md` and `Claude/personas/zel.md`
+  - The old single read of `obsidiano/CLAUDE.md` is gone (check with `grep -c "obsidiano/CLAUDE.md"` — must be 0)
+  - The `console.log` marker line is present
+
+  **IMPORTANT:** the `console.log` line is added deliberately so the log-grep check in Step 38.3 has something to find.
 
 - [ ] **Step 37.6: Type-check and run**
 
@@ -3107,22 +3248,75 @@
   | 4 | No errors in VPS logs | `tail -100` shows no error markers |
   | 5 | Zel did not message other numbers | Only replies to your number |
 
-- [ ] **Step 39.4: If ANY criterion fails → IMMEDIATE ROLLBACK**
+- [ ] **Step 39.4: If ANY criterion fails → IMMEDIATE ROLLBACK (multi-step, read carefully)**
+
+  The rollback touches TWO repos (`zel` on VPS, `obsidiano` on Desktop+remote). Execute in this exact order:
+
+  **Part A — Zel (VPS, local file revert, no remote push):**
 
   ```bash
   # On VPS:
   cd ~/zel
-  git checkout main                           # reverts to pre-split whatsapp-channel.ts
+  git checkout main                           # abandons the feature branch locally
+  git branch -D feat/foundation-dual-prompt-load 2>/dev/null || true
   pm2 restart zel-channel 2>/dev/null || { tmux kill-session -t zel; tmux new-session -d -s zel "bun run channel"; }
   sleep 3
-
-  # ALSO rollback vault split on VPS:
-  cd ~/obsidiano
-  git checkout pre-foundation-2026-04-09 -- CLAUDE.md
-  # Note: this leaves Claude/ folder intact but restores the old monolithic CLAUDE.md
   ```
 
-  After rollback: verify Zel works again (repeat E2 Step 39.1). Then stop implementation and investigate.
+  Zel is now back to reading the OLD single `obsidiano/CLAUDE.md` path. But that old path no longer exists on this machine because VPS already pulled the Chunk 1 split. So Zel will fail on `readFileSync` — Part B is needed.
+
+  **Part B — Vault refactor revert (Desktop → remote → VPS):**
+
+  The Chunk 1 merge (Task 15) is already pushed to `origin/main` on the vault. VPS pulled it in Task 33. We need to revert the remote, then VPS re-pulls.
+
+  ```bash
+  # On DESKTOP (not VPS):
+  cd ~/Documents/obsidiano
+  git log --oneline -5   # identify the Chunk 1 merge commit SHA
+  MERGE_SHA=$(git log --grep "Foundation Chunk 1" --format="%H" -1)
+  git revert -m 1 $MERGE_SHA   # reverts the merge, creates new commit
+  git push origin main
+  ```
+
+  ```bash
+  # On VPS (after Desktop push completes):
+  cd ~/obsidiano
+  git pull
+  # Verify: CLAUDE.md is back to the old Zel prompt (75 lines, starts with "Voce e o Zel")
+  head -5 CLAUDE.md
+  wc -l CLAUDE.md
+  ```
+
+  **Part C — Restart Zel with old prompt:**
+
+  ```bash
+  # On VPS:
+  pm2 restart zel-channel 2>/dev/null || { tmux kill-session -t zel; tmux new-session -d -s zel "bun run channel"; }
+  sleep 3
+  # Send WhatsApp test message — Zel should respond as before Foundation
+  ```
+
+  **Part D — Post-rollback verification:**
+
+  Repeat E2 Step 39.1 (send `oi, quais projetos ativos?` to Zel). Verify Zel responds normally via WhatsApp. If yes, rollback is complete. Stop implementation entirely and investigate the failure mode before attempting Foundation again.
+
+  **Nuclear option if the revert is messy:** all four repos have the `pre-foundation-2026-04-09` tag. Hard reset:
+
+  ```bash
+  # DESKTOP vault:
+  cd ~/Documents/obsidiano && git reset --hard pre-foundation-2026-04-09 && git push --force-with-lease
+
+  # VPS vault:
+  cd ~/obsidiano && git fetch && git reset --hard pre-foundation-2026-04-09
+
+  # VPS zel:
+  cd ~/zel && git reset --hard pre-foundation-2026-04-09
+
+  # Restart Zel
+  pm2 restart zel-channel || { tmux kill-session -t zel; tmux new-session -d -s zel "bun run channel"; }
+  ```
+
+  Force-push is destructive and requires explicit user authorization. The standard revert path (Parts A-C) is preferred.
 
 - [ ] **Step 39.5: If all 5 pass → merge feature branch**
 
@@ -3172,8 +3366,10 @@
 
 - [ ] **Step 41.2: Create auto-promote task**
 
+  Note: the `-l` flag on bash.exe loads the login shell so `$HOME` and PATH are set correctly. The script path uses `$HOME` which Git Bash resolves to `/c/Users/teste`. Logs are captured to `%TEMP%` so a schtasks `/run` can be inspected after execution.
+
   ```powershell
-  $action = New-ScheduledTaskAction -Execute "C:\Program Files\Git\bin\bash.exe" -Argument "-c '/c/Users/teste/.claude/scripts/memory-auto-promote.sh'"
+  $action = New-ScheduledTaskAction -Execute "C:\Program Files\Git\bin\bash.exe" -Argument "-l -c '`$HOME/.claude/scripts/memory-auto-promote.sh >> `$TEMP/memory-auto-promote.tasksched.log 2>&1'"
   $trigger = New-ScheduledTaskTrigger -Daily -At 03:00
   $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U
   Register-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -TaskName "Claude Memory Auto-Promote" -Description "Foundation v1 daily auto-promotion"
@@ -3182,7 +3378,7 @@
 - [ ] **Step 41.3: Create index-rebuild task**
 
   ```powershell
-  $action = New-ScheduledTaskAction -Execute "C:\Program Files\Git\bin\bash.exe" -Argument "-c '/c/Users/teste/.claude/scripts/memory-index-rebuild.sh'"
+  $action = New-ScheduledTaskAction -Execute "C:\Program Files\Git\bin\bash.exe" -Argument "-l -c '`$HOME/.claude/scripts/memory-index-rebuild.sh >> `$TEMP/memory-index-rebuild.tasksched.log 2>&1'"
   $trigger = New-ScheduledTaskTrigger -Daily -At 03:05
   $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U
   Register-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -TaskName "Claude Memory Index Rebuild" -Description "Foundation v1 daily index regen"
@@ -3201,9 +3397,20 @@
   schtasks /run /tn "Claude Memory Auto-Promote"
   Start-Sleep -Seconds 5
   schtasks /run /tn "Claude Memory Index Rebuild"
+  Start-Sleep -Seconds 3
+
+  # Inspect Task Scheduler logs (captured from the redirect in 41.2/41.3)
+  type "$env:TEMP\memory-auto-promote.tasksched.log"
+  type "$env:TEMP\memory-index-rebuild.tasksched.log"
   ```
 
-  Then check logs in `~/.claude/` and vault for heartbeat JSONL line + regenerated INDEX.md.
+  Expected:
+  - `memory-auto-promote.tasksched.log`: empty or heartbeat JSONL line
+  - `memory-index-rebuild.tasksched.log`: empty (script is silent on success)
+  - `~/Documents/obsidiano/Claude/memory/.promotion-log.jsonl`: last line has `"action":"cron-run"`
+  - `~/Documents/obsidiano/Claude/memory/INDEX.md`: `last_updated` is today
+
+  If logs contain errors like "command not found" or "No such file or directory", the bash `-l` flag didn't load the profile correctly — investigate and add PATH manually.
 
 ### Task 42: Create VPS crontab entries
 
