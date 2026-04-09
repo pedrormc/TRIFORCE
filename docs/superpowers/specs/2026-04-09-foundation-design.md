@@ -237,10 +237,27 @@ This is production code. The change ships on a feature branch with immediate pos
    sleep 3                                          # give it time to boot
    ```
 5. **Log-grep smoke check (immediate, BEFORE E2):**
+
+   The Zel log location is not fully standardized in the current repo — it may be `~/zel/logs/channel.log`, `~/.pm2/logs/zel-channel-out.log`, stdout of the tmux session, or absent entirely depending on how Zel was last started. The check uses a fallback chain:
+
    ```bash
-   tail -50 ~/zel/logs/channel.log 2>/dev/null | grep -E "(loaded.*CLAUDE|persona.*zel|system prompt)" && echo "✅ prompt loaded" || echo "❌ no prompt load log"
-   tail -50 ~/zel/logs/channel.log 2>/dev/null | grep -iE "(error|exception|ENOENT|cannot find)" && echo "❌ errors present" || echo "✅ no errors"
+   # Resolve log source with fallback
+   if [ -f ~/zel/logs/channel.log ]; then
+     LOG_CMD="tail -50 ~/zel/logs/channel.log"
+   elif command -v pm2 >/dev/null && pm2 list 2>/dev/null | grep -q zel-channel; then
+     LOG_CMD="pm2 logs zel-channel --nostream --lines 50"
+   elif tmux has-session -t zel 2>/dev/null; then
+     LOG_CMD="tmux capture-pane -pt zel -S -50"
+   else
+     LOG_CMD="echo '(no log source found — cannot smoke-check logs, proceeding to E2 manually)'"
+   fi
+
+   # Run grep patterns against resolved log source
+   $LOG_CMD | grep -E "(loaded.*CLAUDE|persona.*zel|system prompt)" && echo "✅ prompt loaded" || echo "⚠️ no prompt load log (may be stdout-only)"
+   $LOG_CMD | grep -iE "(error|exception|ENOENT|cannot find)" && echo "❌ errors present" || echo "✅ no errors"
    ```
+
+   If the log source resolves to "no log source found", the smoke check is informational only — proceed directly to E2 (WhatsApp round-trip) which is the authoritative test. E2 failure means rollback regardless of log state.
 6. **Only after both smoke checks are green:** proceed to E2E test E2 (WhatsApp round-trip).
 7. **If any smoke check fails:** immediate rollback via `git checkout main && cd ~/zel && bun run channel` (reverts to working single-file loader).
 
@@ -531,11 +548,14 @@ Ralph is marked deprecated in `claude-code-toolkit/README.md`. It is NOT deleted
 node --version    # must be >= v20.0.0
 npx --version     # must print a version
 
-# 2. Vault cloned
+# 2. jq available (required by smoke tests S10/S12)
+command -v jq || sudo apt-get install -y jq
+
+# 3. Vault cloned
 test -d /home/claude/obsidiano || \
   (cd /home/claude && git clone https://github.com/pedrormc/obsidiano.git)
 
-# 3. mcpvault package reachable from npm registry
+# 4. mcpvault package reachable from npm registry
 npx -y @bitbonsai/mcpvault@latest --help >/dev/null 2>&1 && echo "✅ reachable" || echo "❌ check network or proxy"
 ```
 
@@ -608,7 +628,7 @@ Documented in `TRIFORCE/docs/setup-mobile.md`. Contains full install instruction
 | `SessionStart` | `session-start-memory-loader.sh` | No | Load unified memory into session context |
 | `PostToolUse` (Write to `~/.claude/sessions/`) | `save-session-vault-mirror.sh` | No | Mirror session files to vault |
 | `Stop` (session end) | `session-end-memory-writer.sh` | No | Update active.md, regenerate INDEX, auto-commit |
-| `PostToolUse` (Edit/Write to memory files) | `post-edit-memory-validator.sh` | Yes | Validate YAML, update last_updated |
+| `PostToolUse` (Edit/Write to memory files) | `post-edit-memory-validator.sh` | No (warns only) | Validate YAML, update last_updated |
 | Cron (daily 03:00) | `memory-auto-promote.sh` | — | Promote cross-project patterns to global memory |
 | Cron (daily 03:05) | `memory-index-rebuild.sh` | — | Rebuild INDEX.md |
 
@@ -667,7 +687,9 @@ Fires on every Edit/Write. Filters for paths matching `obsidiano/Claude/memory/*
 2. Auto-updates `last_updated: <today>` via sed
 3. If the file is in the vault, auto-commits silently
 
-Blocking on failure (exit 1) to prevent malformed writes.
+**Non-blocking by design.** Exits 0 on malformed YAML, emits a warning to stderr formatted as `⚠️ memory-validator: <reason> in <path>`. A user typo in YAML frontmatter does NOT fail the Edit tool — an in-progress session must never be blocked by a validator. Enforcement of strict schema lives in `memory-update.sh` (§5.5), which is the canonical write path; the validator is a best-effort sidecar.
+
+The auto-commit in step 3 includes the warning in the commit message when present, so malformed YAML is visible in `git log` even though the session was not interrupted.
 
 ### 7.4 Session end hook (`session-end-memory-writer.sh`)
 
@@ -799,7 +821,7 @@ All smoke tests automated in `~/.claude/scripts/foundation-smoke.sh`. Integratio
 | S1 | Vault CLAUDE.md is loader | `head -5 ~/Documents/obsidiano/CLAUDE.md` | Contains "Vault Claude Instructions" and references `Claude/personas/` |
 | S2 | Claude/CLAUDE.md exists | `test -f ~/Documents/obsidiano/Claude/CLAUDE.md` | Exit 0, non-empty |
 | S3 | Zel persona extracted | `head -10 ~/Documents/obsidiano/Claude/personas/zel.md` | Starts with "Voce e o Zel" |
-| S4 | 6 memory files populated | `ls ~/Documents/obsidiano/Claude/memory/*.md \| wc -l` | `>= 7` (6 seeds + INDEX) |
+| S4 | 6 memory files populated | `find ~/Documents/obsidiano/Claude/memory -maxdepth 1 -name "*.md" \| wc -l` | `== 7` (6 seeds + INDEX.md; excludes `.promotion-log.jsonl` which is not .md) |
 | S5 | active.md has real sections | `grep -c "^##" ~/Documents/obsidiano/Claude/memory/active.md` | `>= 3` |
 | S6 | INDEX.md auto_generated | `grep "auto_generated: true" ~/Documents/obsidiano/Claude/memory/INDEX.md` | Match |
 | S7 | Gstack installed | `ls ~/.claude/skills/ \| grep -c gstack` | `>= 1` |
