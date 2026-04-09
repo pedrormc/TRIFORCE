@@ -218,19 +218,49 @@ const persona = readFileSync('/home/claude/obsidiano/Claude/personas/zel.md', 'u
 const systemPrompt = `${generic}\n\n---\n\n${persona}`;
 ```
 
-This change is mandatory for the split to work without regressing Zel. E2E test E2 (§ 7.4) validates it.
+#### Deploy strategy
+
+This is production code. The change ships on a feature branch with immediate post-deploy verification before E2E:
+
+1. **Branch:** `feat/foundation-dual-prompt-load` off `main` in `pedrormc/zel`
+2. **Commit:** single commit touching only `whatsapp-channel.ts` (and any import test if exists)
+3. **Pre-deploy check (runs on VPS before restart):**
+   ```bash
+   cd ~/zel && git fetch && git checkout feat/foundation-dual-prompt-load
+   bun --version                                    # sanity
+   bun x tsc --noEmit whatsapp-channel.ts           # type-check only
+   ```
+4. **Restart sequence:**
+   ```bash
+   pm2 stop zel-channel 2>/dev/null || tmux kill-session -t zel 2>/dev/null
+   cd ~/zel && bun run channel &                    # starts fresh
+   sleep 3                                          # give it time to boot
+   ```
+5. **Log-grep smoke check (immediate, BEFORE E2):**
+   ```bash
+   tail -50 ~/zel/logs/channel.log 2>/dev/null | grep -E "(loaded.*CLAUDE|persona.*zel|system prompt)" && echo "✅ prompt loaded" || echo "❌ no prompt load log"
+   tail -50 ~/zel/logs/channel.log 2>/dev/null | grep -iE "(error|exception|ENOENT|cannot find)" && echo "❌ errors present" || echo "✅ no errors"
+   ```
+6. **Only after both smoke checks are green:** proceed to E2E test E2 (WhatsApp round-trip).
+7. **If any smoke check fails:** immediate rollback via `git checkout main && cd ~/zel && bun run channel` (reverts to working single-file loader).
+
+#### Merge policy
+
+The branch `feat/foundation-dual-prompt-load` is NOT merged to main until both the log-grep smoke check AND E2E test E2 pass. After merge, tag as `v2.1.0-foundation`.
+
+This change is mandatory for the split to work without regressing Zel. E2E test E2 (§ 8.4) validates the end-to-end WhatsApp round-trip.
 
 ### 3.5 Rollback
 
-Five-command rollback restores the original state:
+Three-command rollback restores the original state. The refactor runs on a feature branch, so aborting is a branch delete:
 
 ```bash
 cd ~/Documents/obsidiano
-git checkout main
-rm -rf Claude/personas Claude/memory Claude/sessions Claude/CLAUDE.md
-mv CLAUDE.md.backup CLAUDE.md
-git checkout -- CLAUDE.md
+git checkout main                                         # returns to untouched main
+git branch -D feat/foundation-claude-split                # discards the feature branch
 ```
+
+The `CLAUDE.md.backup` file created in step 1 of §3.3 is a belt-and-suspenders safety net for non-git edits and can be discarded after the rollback. Do NOT run `git checkout -- CLAUDE.md` — main is already clean, and that command would have overwritten a restored backup anyway.
 
 ---
 
@@ -291,6 +321,19 @@ last_updated: YYYY-MM-DD
 - Active repos
 - Written rarely, mostly by user
 
+#### 4.1.7 Write semantics matrix (quick reference)
+
+| File | Writer | Trigger | Mode |
+|---|---|---|---|
+| `active.md` | Claude | session-end hook (last 3 sessions) + user (manual) | edit-in-place |
+| `decisions.md` | Claude | decision-detector heuristic during session + user (manual) | append-only |
+| `people.md` | Claude | when new fact learned about a person + user (manual) | append-only |
+| `preferences.md` | user (primary) + auto-promote cron | manual edits + cron promotions | edit + append |
+| `projects.md` | Claude | on new project detected + user (manual) | append + edit-in-place |
+| `user.md` | user (only) | manual edits | edit-in-place |
+| `INDEX.md` | script | session-end hook + daily cron | replace (auto-generated) |
+| `.promotion-log.jsonl` | auto-promote + memory-revert | cron + user commands | append-only |
+
 ### 4.2 Load strategy
 
 All six files are loaded on every session start (user decision during brainstorming: full load preferred over partial, token cost ~2000 acceptable for 1M context). Token budget breakdown:
@@ -309,7 +352,9 @@ All writes go through either:
 - MCPVault (for `Claude/memory/*.md`) — prevents YAML frontmatter corruption
 - `~/.claude/scripts/memory-update.sh` (unified wrapper) — validates schema, updates `last_updated`, commits
 
-Direct `Edit` tool writes to memory files are discouraged; the PostToolUse validator hook (§ 6.3) catches them anyway.
+Direct `Edit` tool writes to memory files are allowed but **warned**, not blocked. The PostToolUse validator hook (§ 7.3) validates YAML frontmatter and emits a warning to stderr if malformed. It does NOT fail the edit — a typo must not brick an in-progress session. Enforcement boundary is `memory-update.sh`, which is the canonical write path.
+
+Rationale: blocking an `Edit` on memory files would make quick fixes impossible from inside a session and create a frustrating UX. Warning allows user to fix on the next save cycle, and the auto-commit hook ensures the warning is visible in the commit message if the YAML is malformed.
 
 ### 4.4 Size limits and compaction
 
@@ -382,15 +427,15 @@ Regenerated by `~/.claude/scripts/memory-index-rebuild.sh` on session end and on
 
 ### 5.4 Wiki links cross-system
 
-Three syntaxes, each resolved by Claude when relevant:
+Three syntaxes serve different resolution mechanisms:
 
-| Syntax | Target | Example |
-|---|---|---|
-| `[[Folder/Note]]` | Vault Obsidian (humano) | `[[Clientes/Eduardo Dib]]` |
-| `@~/.claude/projects/<id>/memory/<file>` | Auto-memory entry | `@~/.claude/projects/C--Users-teste-Desktop-n8n-Mili/memory/project_hubspot_singular_kanban.md` |
-| `@github:pedrormc/<repo>` | GitHub repo | `@github:pedrormc/Mel` |
+| Syntax | Target | Example | Foundation resolution |
+|---|---|---|---|
+| `[[Folder/Note]]` | Vault Obsidian (humano) | `[[Clientes/Eduardo Dib]]` | **Active** — MCPVault resolves and fetches on read |
+| `@~/.claude/projects/<id>/memory/<file>` | Auto-memory entry | `@~/.claude/projects/C--Users-teste-Desktop-n8n-Mili/memory/project_hubspot_singular_kanban.md` | **Active** — Claude follows via Read tool when context demands |
+| `@github:pedrormc/<repo>` | GitHub repo | `@github:pedrormc/Mel` | **Visual only in Foundation** — Claude recognizes the marker and can follow via `gh` CLI manually, but no automatic resolver is implemented. Treat as a label meaning "the canonical project lives there". |
 
-MCPVault natively handles `[[wiki links]]`. The other two are recognized by Claude at read time.
+MCPVault natively handles `[[wiki links]]`. Auto-memory `@path` references are literal paths Claude can open. The `@github:` marker is a naming convention — if automated resolution becomes a need, Phase 2 may add a resolver script, but Foundation does not ship one.
 
 ### 5.5 `memory-update.sh` unified API
 
@@ -425,7 +470,8 @@ The script:
 | `namespace-cheatsheet.md` rule | ✅ | ✅ | documented |
 | Memory hooks (`session-start`, `session-end`, etc.) | ✅ | ✅ | documented |
 | Auto-promote cron | ✅ (Task Scheduler) | ✅ (cron) | ❌ |
-| **Context7** | ❌ removed (see NG6) | ❌ | ❌ |
+
+Context7 is explicitly out of scope — see § 1.4 NG6. Not listed in the matrix because it is not installed anywhere.
 
 ### 6.2 Gstack installation
 
@@ -440,12 +486,23 @@ Installed in single-machine mode (not team mode) for Foundation. Installs 33 sla
 
 ### 6.3 RuFlo installation (VPS only, workers disabled)
 
+**Canonical install command (locked for Foundation):**
+
 ```bash
 # VPS only
-npm install -g claude-flow  # or npx ruflo@latest init
+npx ruflo@latest init --install-only --no-start
 ```
 
-Add to VPS `~/.claude/settings.json`:
+The `--install-only --no-start` flags ensure binaries and MCP server config are placed on disk without launching any worker processes. This is the "workers OFF" state for Phase 1.
+
+**Binary verification:**
+
+```bash
+which ruflo || npx ruflo --version    # should print v3.5.x
+ls ~/.ruflo/ 2>/dev/null               # expected: config, agents/, policy/, memory/
+```
+
+**Add to VPS `~/.claude/settings.json`:**
 
 ```json
 {
@@ -453,7 +510,13 @@ Add to VPS `~/.claude/settings.json`:
 }
 ```
 
-RuFlo is installed but workers are disabled in Foundation. Phase 2 enables workers for the autonomous tasks sub-project (D).
+**Workers OFF verification:**
+
+```bash
+pgrep -f "ruflo.*worker" && echo "❌ workers running" || echo "✅ workers off"
+```
+
+RuFlo is installed but workers are disabled in Foundation. Phase 2 enables workers for the autonomous tasks sub-project (D) by removing `ruflo-workers` from the disabled list and running `npx ruflo start --workers=N`.
 
 ### 6.4 Ralph deprecation
 
@@ -461,7 +524,24 @@ Ralph is marked deprecated in `claude-code-toolkit/README.md`. It is NOT deleted
 
 ### 6.5 MCPVault replication to VPS
 
-Add to VPS `~/.claude.json`:
+**Prerequisites (verify BEFORE editing config):**
+
+```bash
+# 1. Node.js 20+ and npx available
+node --version    # must be >= v20.0.0
+npx --version     # must print a version
+
+# 2. Vault cloned
+test -d /home/claude/obsidiano || \
+  (cd /home/claude && git clone https://github.com/pedrormc/obsidiano.git)
+
+# 3. mcpvault package reachable from npm registry
+npx -y @bitbonsai/mcpvault@latest --help >/dev/null 2>&1 && echo "✅ reachable" || echo "❌ check network or proxy"
+```
+
+If Node is missing, install via `curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -` and `sudo apt-get install -y nodejs` BEFORE proceeding. Foundation does not install Node itself — it assumes a working Node environment on the VPS (the VPS runs Zel/Bun, so Node is expected but not guaranteed; this check makes the assumption explicit).
+
+**Add to VPS `~/.claude.json`:**
 
 ```json
 {
@@ -475,7 +555,11 @@ Add to VPS `~/.claude.json`:
 }
 ```
 
-Prerequisite: vault cloned at `/home/claude/obsidiano` on VPS.
+**Post-install verification:**
+
+```bash
+claude 2>&1 | head -20   # session should not error on MCPVault connection
+```
 
 ### 6.6 `namespace-cheatsheet.md` rule
 
@@ -541,6 +625,23 @@ Detects OS (Windows/Linux/Termux) to locate vault path. Computes cwd hash matchi
 
 Output is injected as initial context by Claude Code. Token cost: ~3500-4500.
 
+#### Failure mode (CRITICAL)
+
+A hook failure MUST NOT block session start. Foundation guarantees:
+
+- Script uses `set -uo pipefail` (not `-e`) — missing files are tolerated
+- Every file read goes through `safe_cat()` helper that emits `<!-- ARQUIVO AUSENTE: <path> -->` on missing files instead of failing
+- **Hook always exits 0.** Any internal error is swallowed, logged to `~/.claude/hooks/session-start-memory-loader.log`, and replaced by a degraded context marker at the top of output:
+  ```
+  === ⚠️ MEMORY LOADER DEGRADED — partial context only ===
+  Reason: <error summary>
+  Full log: ~/.claude/hooks/session-start-memory-loader.log
+  ```
+- If the vault directory itself is unreachable (partial install, detached volume, MCPVault down), the hook emits ONLY the degraded marker and exits 0. The session starts with whatever Layer 1 (`~/.claude/CLAUDE.md`) provides. User can work without memory context until the issue is fixed — the session is never bricked.
+- If `~/.claude/settings.json` is misconfigured and the hook binary is missing entirely, Claude Code skips the missing hook (standard harness behavior) and the session still starts.
+
+This failure-tolerant design is non-negotiable: a single bad vault state must not prevent `claude` from launching in any environment.
+
 Configuration in `~/.claude/settings.json`:
 
 ```json
@@ -588,7 +689,18 @@ Triggers when `/save-session` writes a file to `~/.claude/sessions/`. Copies the
 
 **Filter 2 — Age:** entry must be **7+ days old** in auto-memory before eligible. Prevents promoting ideas that may be revised.
 
-**Filter 3 — Confidence:** similarity score between entries must be **>= 0.75**. Captures paraphrases while rejecting unrelated content.
+**Filter 3 — Confidence (similarity mechanism):** similarity score between two entries must be **>= 0.75**.
+
+Computed as **token-set Jaccard** on normalized content:
+
+1. Strip YAML frontmatter
+2. Lowercase
+3. Strip punctuation and stop-words (pt-BR stop list: `de|a|o|que|e|do|da|em|um|para|é|com|não|uma|os|no|se|na|por|mais|as|dos|como|mas|foi|ao|ele|das|à|seu|sua`)
+4. Tokenize by whitespace
+5. Build sets A and B
+6. `similarity = |A ∩ B| / |A ∪ B|`
+
+Threshold 0.75 means two entries share >= 75% of distinct meaningful tokens. This is cheap (no embedding model required), deterministic (reproducible), and adequate for short auto-memory entries (typically 20-200 tokens). If an entry is longer than 500 tokens, it is excluded from the similarity pool (cap to prevent pathological cases). Phase 2 may upgrade to embedding-based similarity if needed, but Foundation uses Jaccard only.
 
 **Filter 4 — Allow-list of types:** promotes only `feedback` → `preferences`, `reference` → `projects` or `people`. **Never promotes `project` type** (cwd-specific by design).
 
@@ -616,6 +728,15 @@ entry_id: <unique id>
 **Filter 8 — Originals preserved:** source auto-memory entries are NEVER deleted during promotion. Promotion is a copy + tag operation.
 
 **Filter 9 — Max per run:** hard limit of 5 promotions per cron run to prevent vault flooding in edge cases.
+
+**Empty-state handling (Day 1 and beyond):** when the candidate set is empty (no entries meet all filters — typical on Day 1 when auto-memory has only one cwd), the cron script:
+
+1. Exits 0 (success, not failure)
+2. Appends a single line to `.promotion-log.jsonl`:
+   ```json
+   {"timestamp":"<ISO>","action":"cron-run","promoted":0,"eligible":0,"reason":"empty_candidate_set"}
+   ```
+3. Produces no output (silent). Monitoring systems should treat the empty-state line as healthy heartbeat, not as failure.
 
 **Filter 10 — Easy reversion:** `~/.claude/scripts/memory-revert.sh <entry-id>` reads the log, removes the entry from the target file, marks the log entry as `reverted: true` (does not delete log entry — audit trail preserved).
 
@@ -671,6 +792,8 @@ All smoke tests automated in `~/.claude/scripts/foundation-smoke.sh`. Integratio
 
 ### 8.2 Smoke tests (run first, per-component)
 
+> **Shell note:** all smoke tests run under **bash** (Git Bash on Windows, native bash on Linux, bash on Termux). They do NOT run under PowerShell or cmd.exe on Windows. The smoke runner script sets `#!/usr/bin/env bash`.
+
 | # | Test | Command | Success criterion |
 |---|---|---|---|
 | S1 | Vault CLAUDE.md is loader | `head -5 ~/Documents/obsidiano/CLAUDE.md` | Contains "Vault Claude Instructions" and references `Claude/personas/` |
@@ -682,10 +805,12 @@ All smoke tests automated in `~/.claude/scripts/foundation-smoke.sh`. Integratio
 | S7 | Gstack installed | `ls ~/.claude/skills/ \| grep -c gstack` | `>= 1` |
 | S8 | SessionStart hook exists | `test -x ~/.claude/hooks/session-start-memory-loader.sh` | Exit 0 |
 | S9 | Session-end hook exists | `test -x ~/.claude/hooks/session-end-memory-writer.sh` | Exit 0 |
-| S10 | Ralph disabled | `grep -c ralph ~/.claude/settings.json` | `>= 1` (inside disabledPlugins) |
+| S10 | Ralph disabled (strict) | `jq -e '.disabledPlugins \| any(. \| test("ralph"))' ~/.claude/settings.json` | Exit 0 (strict jq check inside disabledPlugins array, not substring anywhere) |
 | S11 | Namespace rule exists | `test -f ~/.claude/rules/common/namespace-cheatsheet.md` | Exit 0 |
-| S12 | MCPVault configured | `grep -c mcpvault ~/.claude.json` | `>= 1` |
+| S12 | MCPVault configured | `jq -e '.mcpServers.obsidian.command' ~/.claude.json` | Exit 0 |
 | S13 | Auto-promote script exists | `test -x ~/.claude/scripts/memory-auto-promote.sh` | Exit 0 |
+
+Tests S10 and S12 require `jq` to be installed. Foundation install adds `jq` to the toolchain prerequisites (check: `command -v jq || apt-get install jq` on VPS; already present in Git Bash on Windows).
 
 ### 8.3 Integration tests (run after smoke pass)
 
@@ -694,10 +819,57 @@ All smoke tests automated in `~/.claude/scripts/foundation-smoke.sh`. Integratio
 | I1 | Memory loader output complete | Run `bash ~/.claude/hooks/session-start-memory-loader.sh` | Has all 4 sections, no `<!-- ARQUIVO AUSENTE -->` |
 | I2 | New Claude session reads memory | Open `claude`, ask "what do you know about me?" | Response cites CTO Singular, pedrormc, 3 envs, TRIFORCE |
 | I3 | Memory write auto-commits | Edit `Claude/memory/active.md` via Edit tool | `git log -1` shows auto-commit within seconds |
-| I4 | Auto-promote with synthetic data | Create 3 identical fake auto-memory entries with `mtime >= 7 days ago` in different project dirs, run `memory-auto-promote.sh` | Promotion written to preferences.md with frontmatter tag, log line appended |
+| I4 | Auto-promote with synthetic data | See §8.3.1 below for full reproducible script | Promotion written to preferences.md with frontmatter tag, log line appended |
 | I5 | Reversion works | Run `memory-revert.sh <entry-id>` on I4's promotion | Entry removed from preferences.md, log marked `reverted: true` |
 | I6 | INDEX regen reflects changes | Add a new file to `Claude/memory/`, run `memory-index-rebuild.sh` | INDEX.md lists the new file |
 | I7 | Gstack slash commands appear | Open `claude`, type `/` | List includes `/office-hours`, `/autoplan`, `/review`, `/ship`, `/qa`, `/cso` |
+
+#### 8.3.1 I4 reproducible fake-data script
+
+```bash
+#!/usr/bin/env bash
+# Creates 3 synthetic auto-memory entries in distinct fake project cwds, with mtimes
+# older than 7 days, to exercise the auto-promote pipeline end-to-end.
+
+set -euo pipefail
+
+PROJECTS="$HOME/.claude/projects"
+FAKE_CONTENT="PT-BR informal, direto, sem emojis a menos que explicitamente solicitado"
+TARGETS=(
+  "$PROJECTS/fake-proj-alpha/memory"
+  "$PROJECTS/fake-proj-beta/memory"
+  "$PROJECTS/fake-proj-gamma/memory"
+)
+
+for dir in "${TARGETS[@]}"; do
+  mkdir -p "$dir"
+  cat > "$dir/feedback_lang.md" <<'EOF'
+---
+name: Communication style
+description: PT-BR informal, sem emojis, direto
+type: feedback
+scope: per-cwd
+source: auto-memory
+last_updated: 2026-03-20
+---
+
+PT-BR informal, direto, sem emojis a menos que explicitamente solicitado.
+EOF
+  # Backdate mtime to 14 days ago (well past the 7-day threshold)
+  touch -d "14 days ago" "$dir/feedback_lang.md"
+done
+
+echo "✅ 3 synthetic entries created in fake project dirs with mtime 14 days ago"
+echo "Now run: bash ~/.claude/scripts/memory-auto-promote.sh"
+echo "Verify:"
+echo "  grep -A5 'auto_promoted: true' ~/Documents/obsidiano/Claude/memory/preferences.md"
+echo "  tail -3 ~/Documents/obsidiano/Claude/memory/.promotion-log.jsonl"
+echo ""
+echo "Cleanup after test:"
+echo "  rm -rf $PROJECTS/fake-proj-{alpha,beta,gamma}"
+```
+
+The script uses GNU `touch -d` to backdate. On macOS/BSD systems, use `touch -t` with the equivalent format. Windows Git Bash ships with GNU touch and supports `-d`.
 
 ### 8.4 E2E tests (run last, manual)
 
@@ -784,10 +956,16 @@ git push origin pre-foundation-2026-04-09
 |---|---|
 | Memory loader slow | Comment out SessionStart hook in settings.json |
 | Auto-promote wrong | Run `memory-revert <id>` or edit `preferences.md` + commit |
-| Vault split breaks Zel | `git revert` the split commit, restart Zel session |
+| Vault split breaks Zel | `git revert` the split commit, restart Zel session via `bun run channel` |
 | Gstack conflicts with Superpowers | Add `gstack` to `disabledPlugins` in settings.json |
 | Auto-commit polluting | Remove `git commit` from session-end hook |
-| Everything broken | `git checkout pre-foundation-2026-04-09` in all three repos, restart claude |
+| MCPVault MCP crashes on VPS | Set `"disabled": true` on obsidian entry in `~/.claude.json`, session falls back to Layer 1 only |
+| Cron/Task Scheduler misfires | Delete the Task Scheduler entry (`schtasks /delete /tn "Claude Memory Auto-Promote"`) or comment out crontab line |
+| Gstack `./setup` partially succeeds | `rm -rf ~/.claude/skills/gstack*` and re-clone fresh |
+| RuFlo install corrupts Node global | `npm uninstall -g claude-flow` + `rm -rf ~/.ruflo/` |
+| **Any failure not listed above** | Universal: `git checkout pre-foundation-2026-04-09` in all three repos, `~/.claude/scripts/foundation-uninstall.sh` to remove hooks and cron, restart claude |
+
+The universal rollback script `foundation-uninstall.sh` is part of Foundation deliverables. It removes all hook entries from `settings.json`, deletes scheduled tasks, unlinks symlinks, and leaves the backup files in place. It does NOT delete the `Claude/` vault folder (user may want to salvage memory content).
 
 ### 8.7 Test execution order (during implementation)
 
@@ -832,29 +1010,65 @@ Repeated here for clarity. These are future sub-projects, not Foundation:
 
 ### 11.1 Mobile installation instructions (deferred)
 
-See `TRIFORCE/docs/setup-mobile.md` for full instructions. Summary:
+Full instructions below. Foundation also updates `TRIFORCE/docs/setup-mobile.md` with this content. This appendix is self-contained — executing it does not require re-reading this spec.
+
+**Prerequisites (Termux on Poco F5):**
+
+```bash
+# Termux has a quirk with /tmp. Fix first (required by Pedro's env):
+termux-setup-storage
+pkg update && pkg install nodejs bun git jq curl coreutils proot
+
+# The proot /tmp fix (from Pedro's memory):
+mkdir -p ~/tmp && echo 'export TMPDIR=$HOME/tmp' >> ~/.bashrc
+source ~/.bashrc
+```
+
+**Install steps:**
 
 ```bash
 # 1. Pull toolkit and run install.sh
-cd ~/claude-code-toolkit && git pull
-bash install.sh --force
+cd ~/claude-code-toolkit && git pull || git clone https://github.com/pedrormc/claude-code-toolkit.git ~/claude-code-toolkit
+bash ~/claude-code-toolkit/install.sh --force
 
 # 2. Clone vault
-cd ~ && git clone https://github.com/pedrormc/obsidiano.git
+cd ~ && git clone https://github.com/pedrormc/obsidiano.git || (cd ~/obsidiano && git pull)
 
-# 3. Add MCPVault to ~/.claude.json
-# (path: /data/data/com.termux/files/home/obsidiano)
+# 3. Add MCPVault to ~/.claude.json (Termux path)
+# Edit ~/.claude.json and add under mcpServers:
+#   "obsidian": {
+#     "command": "npx",
+#     "args": ["@bitbonsai/mcpvault@latest", "/data/data/com.termux/files/home/obsidiano"],
+#     "disabled": false
+#   }
 
 # 4. Install Gstack
 git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack
 cd ~/.claude/skills/gstack && ./setup
 
-# 5. Smoke test
+# 5. Validate hooks script works under Termux bash
+bash ~/.claude/hooks/session-start-memory-loader.sh | head -20
+
+# 6. Smoke test
 claude
 > "leia Claude/memory/active.md"
 ```
 
-No Context7. No RuFlo. No auto-promote cron (Termux limitation).
+**What Mobile does NOT get (same as Foundation matrix):**
+- No Context7 (removed from scope)
+- No RuFlo (VPS only)
+- No auto-promote cron (Termux cron is fragile — skip until Phase 2)
+- No Task Scheduler / crontab entries
+
+**Mobile-specific Foundation flags:**
+- Memory loader runs in degraded mode if `/data/data/com.termux/files/home/obsidiano` is not mounted
+- Session-end hook auto-commits but does NOT auto-push (no credentials cached)
+- Test S7-S13 apply; S10/S12 require jq (installed in prerequisites above)
+
+**Known Termux gotchas:**
+- `touch -d` works (GNU touch available via coreutils package)
+- `set -uo pipefail` works in Termux bash
+- `npx` works but may prompt once for confirmation on first run — accept with `y`
 
 ### 11.2 Seed file extraction sources
 
